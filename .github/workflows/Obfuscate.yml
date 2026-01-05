@@ -1,12 +1,15 @@
-name: Build and Obfuscate BPB Panel
+
+name: Build Obfuscate BPB Panel
 
 on:
   push:
     branches:
       - main
   schedule:
-    # 每天凌晨1:00运行
+    # 每天 1:00（UTC）运行；中国时区约等于上午 9:00
     - cron: "0 1 * * *"
+  # 允许在 Actions 页面手动触发
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,40 +19,72 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 检出代码
+      - name: Check out the code
         uses: actions/checkout@v4
 
-      - name: 设置 Node.js 环境
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "latest"
+          node-version: "latest"   # 用稳定的 LTS/当前版本，避免 latest 带来不确定性
 
-      - name: 安装依赖项
+      - name: Install obfuscator
         run: |
           npm install -g javascript-obfuscator
 
-      - name: 下载 BPB worker.js
+      # ★ 关键修复：从 Releases 获取最新的 worker.js，保存为 origin.js
+      - name: Download latest BPB worker.js as origin.js
+        env:
+          REPO: bia-pain-bache/BPB-Worker-Panel
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          wget -O origin.js https://raw.githubusercontent.com/bia-pain-bache/BPB-Worker-Panel/main/build/unobfuscated-worker.js
+          set -e
+          API_URL="https://api.github.com/repos/$REPO/releases"
+          # 获取最新 Release 信息
+          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$API_URL")
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name=="worker.js") | .browser_download_url')
 
-      - name: 混淆 BPB worker.js
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo "未在最新 Release 找到 worker.js，改为下载 worker.zip 后解压..."
+            DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name=="worker.zip") | .browser_download_url')
+            if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+              echo "最新 Release 不包含 worker.js/worker.zip，退出。"
+              exit 1
+            fi
+            curl -L -o worker.zip "$DOWNLOAD_URL"
+            unzip -o worker.zip
+            # 解压出来的 worker.js 作为 origin.js
+            mv -f worker.js origin.js
+            rm -f worker.zip
+          else
+            echo "最新版本: $TAG_NAME"
+            echo "下载地址: $DOWNLOAD_URL"
+            curl -L -o origin.js "$DOWNLOAD_URL"
+          fi
+
+          ls -l origin.js
+          # 记录版本号，方便后续比对
+          echo "${TAG_NAME:-unknown}" > version.txt
+
+      - name: Obfuscate BPB worker js
         run: |
           javascript-obfuscator origin.js --output _worker.js \
             --compact true \
-            --control-flow-flattening false \
-            --dead-code-injection false \
-            --identifier-names-generator mangled \
-            --rename-globals false \
+            --control-flow-flattening true \
+            --control-flow-flattening-threshold 1 \
+            --dead-code-injection true \
+            --dead-code-injection-threshold 1 \
+            --identifier-names-generator hexadecimal \
+            --rename-globals true \
             --string-array true \
             --string-array-encoding 'rc4' \
-            --string-array-threshold 0.75 \
+            --string-array-threshold 1 \
             --transform-object-keys true \
             --unicode-escape-sequence true
 
-      - name: 提交更改
+      - name: Commit changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           branch: main
-          commit_message: ':arrow_up: 更新最新的 BPB 面板'
-          commit_author: 'github-actions[bot] <github-actions[bot]@users.noreply.github.com>'
-          push_options: '--set-upstream'
+          commit_message: ":arrow_up: update latest bpb panel (origin.js + _worker.js)"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
